@@ -74,7 +74,7 @@ function cleanMarkdown(md: string): string {
 /**
  * Découpe une longue chaîne en plusieurs chunks de taille max (par ex. 12k chars).
  */
-function chunkText(text: string, chunkSize = 50000): string[] {
+function chunkText(text: string, chunkSize = 10000): string[] {
   const chunks: string[] = [];
   let startIndex = 0;
   while (startIndex < text.length) {
@@ -193,10 +193,7 @@ ${
     : ''
 }`;
 
-  const truncatedPrompt = promptToLLM.length > 1500
-    ? promptToLLM.substring(0, 1500) + '...\n[TRUNCATED]'
-    : promptToLLM;
-  console.debug(`[generateSerpQueries] PromptToLLM:\n${truncatedPrompt}`);
+  console.debug(`[generateSerpQueries] PromptToLLM:\n${promptToLLM}`);
 
   const res = await generateObject({
     model: o3MiniModel,
@@ -241,11 +238,6 @@ If there's uncertainty, disclaim it.
 <content length=${chunk.length}>
 ${chunk}
 </content>`;
-
-  const truncatedPrompt = promptToLLM.length > 1500
-    ? promptToLLM.substring(0, 1500) + '...\n[TRUNCATED]'
-    : promptToLLM;
-  console.debug(`[analyzeChunk] Prompt:\n${truncatedPrompt}`);
 
   try {
     const res = await generateObject({
@@ -301,10 +293,7 @@ async function processSerpResult({
 
   // On parcourt chaque "content" (un par URL scrappée)
   for (const content of contents) {
-    // Tronque globalement à 50k (pour éviter d'analyser 200k d'un coup)
-    // puis on chunk par 12k si encore trop grand
-    const truncated = trimPrompt(content, 50000);
-    const splitted = chunkText(truncated, 12000);
+    const splitted = chunkText(content, 30000);
 
     for (const chunk of splitted) {
       // Pour chaque chunk, on appelle analyzeChunk
@@ -349,7 +338,7 @@ export async function writeFinalReport({
   );
 
   const promptToLLM = `Given the user prompt, write a final report including ALL learnings.
-Aim for at least 3 pages of text. Keep it well structured:
+Aim for at least 4 pages of text. Keep it well structured in markdown format:
 
 <prompt>${prompt}</prompt>
 
@@ -357,10 +346,7 @@ Aim for at least 3 pages of text. Keep it well structured:
 ${learningsString}
 </learnings>`;
 
-  const truncatedPrompt = promptToLLM.length > 2000
-    ? promptToLLM.substring(0, 2000) + '...\n[TRUNCATED]'
-    : promptToLLM;
-  console.debug(`[writeFinalReport] Prompt:\n${truncatedPrompt}`);
+  console.debug(`[writeFinalReport] Prompt:\n${promptToLLM}`);
 
   try {
     // Pas de timeout => on laisse l'appel se finir
