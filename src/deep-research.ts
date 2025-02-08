@@ -146,7 +146,8 @@ async function scrapeUrl(url: string, timeout = 20000): Promise<string> {
     }
 
     if (!taskResult) {
-      throw new Error(`Timeout scraping: ${url}`);
+      console.warn(`[scrapeUrl] error scraping for ${url}`);
+      return '';
     }
 
     let markdown = taskResult.result?.fit_markdown || taskResult.result?.markdown || '';
@@ -293,7 +294,8 @@ async function processSerpResult({
 
   // On parcourt chaque "content" (un par URL scrappée)
   for (const content of contents) {
-    const splitted = chunkText(content, 30000);
+    const limitedContent = content.slice(0, 8000);
+    const splitted = chunkText(limitedContent, 8000);
 
     for (const chunk of splitted) {
       // Pour chaque chunk, on appelle analyzeChunk
@@ -332,13 +334,12 @@ export async function writeFinalReport({
   console.info(`[writeFinalReport] Generating final report for "${prompt}"`);
   console.debug(`[writeFinalReport] nbLearnings=${learnings.length}, nbURLs=${visitedUrls.length}`);
 
-  const learningsString = trimPrompt(
-    learnings.map(learning => `<learning>\n${learning}\n</learning>`).join('\n'),
-    150000
-  );
+  const learningsString = learnings
+  .map(learning => `<learning>\n${learning}\n</learning>`)
+  .join('\n');
 
-  const promptToLLM = `Given the user prompt, write a final report including ALL learnings.
-Aim for at least 4 pages of text. Keep it well structured in markdown format:
+  const promptToLLM = `Given the user prompt, write a final report including ALL USEFUL learnings.
+Aim for at least 3 pages of text. Keep it well structured and easy to read.
 
 <prompt>${prompt}</prompt>
 
