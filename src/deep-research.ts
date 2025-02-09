@@ -338,7 +338,7 @@ export async function writeFinalReport({
   .map(learning => `<learning>\n${learning}\n</learning>`)
   .join('\n');
 
-  const promptToLLM = `Given the user prompt, write a final report including ALL USEFUL learnings.
+  const promptToLLM = `Given the user prompt, write a final report, IN FRENCH, including ALL USEFUL learnings.
 Aim for at least 3 pages of text. Keep it well structured and easy to read.
 
 <prompt>${prompt}</prompt>
