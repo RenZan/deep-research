@@ -4,6 +4,8 @@ import pLimit from 'p-limit';
 import { z } from 'zod';
 import fetch from 'node-fetch';
 import TurndownService from 'turndown';
+import http from 'http';
+import https from 'https';
 
 import { o3MiniModel, trimPrompt } from './ai/providers';
 import { systemPrompt } from './prompt';
@@ -17,9 +19,52 @@ export type ResearchResult = {
 };
 
 const ConcurrencyLimit = 2;
+const AnalyzeConcurrencyLimit = 2; // Limite pour l'analyse parallèle des chunks
 const turndownService = new TurndownService();
 
 const SEARXNG_URL = process.env.SEARXNG_URL || 'http://10.13.0.5:8081';
+
+// Agents HTTP/HTTPS pour réutiliser les connexions
+const httpAgent = new http.Agent({ keepAlive: true });
+const httpsAgent = new https.Agent({ keepAlive: true });
+
+function getAgent(url: string): http.Agent | https.Agent {
+  return url.startsWith('https') ? httpsAgent : httpAgent;
+}
+
+/**
+ * Fetch avec timeout et mécanisme de retry.
+ */
+async function fetchWithTimeout(
+  url: string,
+  options: RequestInit = {},
+  timeout: number = 15000,
+  retries = 2
+): Promise<fetch.Response> {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeout);
+  try {
+    // Ajout de l'agent keep-alive
+    const agent = getAgent(url);
+    const response = await fetch(url, { ...options, agent, signal: controller.signal });
+    clearTimeout(id);
+    if (!response.ok) {
+      throw new Error(`HTTP error ${response.status}`);
+    }
+    return response;
+  } catch (error) {
+    clearTimeout(id);
+    if (retries > 0) {
+      // Petite pause avant retry
+      await new Promise(resolve => setTimeout(resolve, 500));
+      return fetchWithTimeout(url, options, timeout, retries - 1);
+    }
+    throw error;
+  }
+}
+
+// Cache pour éviter de scraper plusieurs fois la même URL
+const scrapeCache = new Map<string, Promise<string>>();
 
 /**
  * Effectue une recherche sur SearXNG et retourne les URLs associées.
@@ -30,18 +75,11 @@ async function searchSearxng(
 ): Promise<{ data: Array<{ url: string; snippet?: string }> }> {
   console.info(`[searchSearxng] SERP for "${query}" (limit=${limit}, timeout=${timeout})`);
 
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), timeout);
-
   try {
     const params = new URLSearchParams({ q: query, format: 'json' });
     const url = `${SEARXNG_URL}/search?${params.toString()}`;
-    const response = await fetch(url, { signal: controller.signal });
-    if (!response.ok) {
-      throw new Error(`Erreur HTTP: ${response.status}`);
-    }
+    const response = await fetchWithTimeout(url, {}, timeout);
     const json = await response.json();
-    clearTimeout(timeoutId);
 
     const data = (json.results || [])
       .slice(0, limit)
@@ -55,14 +93,13 @@ async function searchSearxng(
 
     return { data };
   } catch (error) {
-    clearTimeout(timeoutId);
     console.error(`[searchSearxng] Error on "${query}":`, error);
     throw error;
   }
 }
 
 /**
- * Nettoie le Markdown pour le rendre plus exploitable par un LLM
+ * Nettoie le Markdown pour le rendre plus exploitable par un LLM.
  */
 function cleanMarkdown(md: string): string {
   return md
@@ -72,13 +109,22 @@ function cleanMarkdown(md: string): string {
 }
 
 /**
- * Découpe une longue chaîne en plusieurs chunks de taille max (par ex. 12k chars).
+ * Découpe une longue chaîne en plusieurs chunks en essayant de ne pas couper au milieu d'une phrase.
  */
 function chunkText(text: string, chunkSize = 10000): string[] {
   const chunks: string[] = [];
   let startIndex = 0;
   while (startIndex < text.length) {
-    const endIndex = startIndex + chunkSize;
+    let endIndex = startIndex + chunkSize;
+    if (endIndex < text.length) {
+      // Cherche le dernier saut de ligne ou espace avant la limite du chunk
+      const breakIndexNewline = text.lastIndexOf('\n', endIndex);
+      const breakIndexSpace = text.lastIndexOf(' ', endIndex);
+      const breakIndex = Math.max(breakIndexNewline, breakIndexSpace);
+      if (breakIndex > startIndex) {
+        endIndex = breakIndex;
+      }
+    }
     chunks.push(text.slice(startIndex, endIndex));
     startIndex = endIndex;
   }
@@ -87,84 +133,94 @@ function chunkText(text: string, chunkSize = 10000): string[] {
 
 /**
  * Scrape le contenu d'une URL avec Crawl4AI (Markdown le plus propre possible).
+ * Utilise un cache pour éviter les appels redondants.
  */
 async function scrapeUrl(url: string, timeout = 20000): Promise<string> {
-  console.info(`[scrapeUrl] Scraping: ${url}`);
-
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), timeout);
-
-  try {
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-    };
-    if (process.env.CRAWL4AI_API_TOKEN) {
-      headers['Authorization'] = `Bearer ${process.env.CRAWL4AI_API_TOKEN}`;
-    }
-
-    const crawlRequest = {
-      urls: url,
-      priority: 10,
-      options: {
-        ignore_links: true,
-        ignore_images: true,
-        escape_html: true,
-        body_width: 80,
-      },
-    };
-
-    const crawlRes = await fetch(`${process.env.CRAWL4AI_API_URL}/crawl`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(crawlRequest),
-      signal: controller.signal,
-    });
-    if (!crawlRes.ok) {
-      throw new Error(`Erreur HTTP: ${crawlRes.status}`);
-    }
-
-    const crawlJson = await crawlRes.json();
-    const taskId = crawlJson.task_id;
-    if (!taskId) {
-      throw new Error(`Aucun task_id retourné pour ${url}.`);
-    }
-
-    // Polling du résultat
-    const startTime = Date.now();
-    let taskResult: any = null;
-    while (Date.now() - startTime < timeout) {
-      const taskRes = await fetch(`${process.env.CRAWL4AI_API_URL}/task/${taskId}`, { headers, signal: controller.signal });
-      if (!taskRes.ok) {
-        throw new Error(`Erreur HTTP lors du polling: ${taskRes.status}`);
-      }
-      const taskJson = await taskRes.json();
-      if (taskJson.status === "completed") {
-        taskResult = taskJson;
-        break;
-      }
-      await new Promise(resolve => setTimeout(resolve, 2000));
-    }
-
-    if (!taskResult) {
-      console.warn(`[scrapeUrl] error scraping for ${url}`);
-      return '';
-    }
-
-    let markdown = taskResult.result?.fit_markdown || taskResult.result?.markdown || '';
-    if (!markdown && taskResult.result?.html) {
-      markdown = turndownService.turndown(taskResult.result.html);
-    }
-    if (!markdown) {
-      console.warn(`[scrapeUrl] No exploitable Markdown for ${url}`);
-      return '';
-    }
-
-    const cleaned = cleanMarkdown(markdown);
-    console.info(`[scrapeUrl] Got Markdown for ${url}, length=${cleaned.length}`);
-    return cleaned;
-  } finally {
-    clearTimeout(timeoutId);
+  if (scrapeCache.has(url)) {
+    return scrapeCache.get(url)!;
   }
+  const scrapingPromise = (async () => {
+    console.info(`[scrapeUrl] Scraping: ${url}`);
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeout);
+
+    try {
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+      };
+      if (process.env.CRAWL4AI_API_TOKEN) {
+        headers['Authorization'] = `Bearer ${process.env.CRAWL4AI_API_TOKEN}`;
+      }
+
+      const crawlRequest = {
+        urls: url,
+        priority: 10,
+        options: {
+          ignore_links: true,
+          ignore_images: true,
+          escape_html: true,
+          body_width: 80,
+        },
+      };
+
+      const crawlUrl = `${process.env.CRAWL4AI_API_URL}/crawl`;
+      const crawlRes = await fetchWithTimeout(
+        crawlUrl,
+        {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(crawlRequest),
+        },
+        timeout
+      );
+      const crawlJson = await crawlRes.json();
+      const taskId = crawlJson.task_id;
+      if (!taskId) {
+        throw new Error(`Aucun task_id retourné pour ${url}.`);
+      }
+
+      // Polling du résultat
+      const startTime = Date.now();
+      let taskResult: any = null;
+      while (Date.now() - startTime < timeout) {
+        const taskRes = await fetchWithTimeout(
+          `${process.env.CRAWL4AI_API_URL}/task/${taskId}`,
+          { headers },
+          timeout
+        );
+        const taskJson = await taskRes.json();
+        if (taskJson.status === "completed") {
+          taskResult = taskJson;
+          break;
+        }
+        await new Promise(resolve => setTimeout(resolve, 2000));
+      }
+
+      if (!taskResult) {
+        console.warn(`[scrapeUrl] error scraping for ${url}`);
+        return '';
+      }
+
+      let markdown = taskResult.result?.fit_markdown || taskResult.result?.markdown || '';
+      if (!markdown && taskResult.result?.html) {
+        markdown = turndownService.turndown(taskResult.result.html);
+      }
+      if (!markdown) {
+        console.warn(`[scrapeUrl] No exploitable Markdown for ${url}`);
+        return '';
+      }
+
+      const cleaned = cleanMarkdown(markdown);
+      console.info(`[scrapeUrl] Got Markdown for ${url}, length=${cleaned.length}`);
+      return cleaned;
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  })();
+
+  scrapeCache.set(url, scrapingPromise);
+  return scrapingPromise;
 }
 
 /**
@@ -216,7 +272,7 @@ ${
 
 /**
  * Appelle le LLM sur un seul chunk de texte, renvoie { learnings, followUpQuestions } partiels.
- * Pas de timeout => on laisse le LLM répondre aussi longtemps qu'il le faut.
+ * Aucun timeout n'est imposé afin de laisser le LLM répondre sans contrainte.
  */
 async function analyzeChunk({
   query,
@@ -249,7 +305,6 @@ ${chunk}
         learnings: z.array(z.string()),
         followUpQuestions: z.array(z.string()),
       }),
-      // Pas de timeout => on laisse la requête se terminer.
     });
 
     console.debug(`[analyzeChunk] LLM response => learnings=${res.object.learnings.length}, followUps=${res.object.followUpQuestions.length}`);
@@ -261,7 +316,7 @@ ${chunk}
 }
 
 /**
- * Analyse le contenu scrappé en le découpant en chunks si nécessaire,
+ * Analyse le contenu scrappé en le découpant en chunks (en parallèle avec une limite de concurrence),
  * puis combine tous les learnings et followUpQuestions.
  */
 async function processSerpResult({
@@ -276,12 +331,15 @@ async function processSerpResult({
   numFollowUpQuestions?: number;
 }) {
   console.info(`[processSerpResult] Analyzing SERP for "${query}"...`);
-  console.debug(`[processSerpResult] raw data => ${JSON.stringify(result.data.map(d => ({url:d.url, length:(d.markdown||'').length})), null, 2)}`);
-
-  // On récupère tous les markdown non vides
-  const contents = compact(
-    result.data.map(item => item.markdown)
+  console.debug(
+    `[processSerpResult] raw data => ${JSON.stringify(
+      result.data.map(d => ({ url: d.url, length: (d.markdown || '').length })),
+      null,
+      2
+    )}`
   );
+
+  const contents = compact(result.data.map(item => item.markdown));
 
   console.info(`[processSerpResult] Non-empty contents: ${contents.length}`);
   if (!contents.length) {
@@ -292,30 +350,35 @@ async function processSerpResult({
   let aggregatedLearnings: string[] = [];
   let aggregatedFollowUps: string[] = [];
 
-  // On parcourt chaque "content" (un par URL scrappée)
+  const analyzeLimit = pLimit(AnalyzeConcurrencyLimit);
+
   for (const content of contents) {
     const limitedContent = content.slice(0, 8000);
-    const splitted = chunkText(limitedContent, 8000);
-
-    for (const chunk of splitted) {
-      // Pour chaque chunk, on appelle analyzeChunk
-      const partialRes = await analyzeChunk({
-        query,
-        chunk,
-        numLearnings,
-        numFollowUpQuestions,
-      });
-      // On additionne
+    const chunks = chunkText(limitedContent, 8000);
+    const partialResults = await Promise.all(
+      chunks.map(chunk =>
+        analyzeLimit(() =>
+          analyzeChunk({
+            query,
+            chunk,
+            numLearnings,
+            numFollowUpQuestions,
+          })
+        )
+      )
+    );
+    for (const partialRes of partialResults) {
       aggregatedLearnings.push(...partialRes.learnings);
       aggregatedFollowUps.push(...partialRes.followUpQuestions);
     }
   }
 
-  // On peut déduire un ensemble unique
   const uniqueLearnings = [...new Set(aggregatedLearnings)];
   const uniqueFollowUps = [...new Set(aggregatedFollowUps)];
 
-  console.info(`[processSerpResult] Final aggregated => learnings=${uniqueLearnings.length}, followUps=${uniqueFollowUps.length}`);
+  console.info(
+    `[processSerpResult] Final aggregated => learnings=${uniqueLearnings.length}, followUps=${uniqueFollowUps.length}`
+  );
   return { learnings: uniqueLearnings, followUpQuestions: uniqueFollowUps };
 }
 
@@ -335,8 +398,8 @@ export async function writeFinalReport({
   console.debug(`[writeFinalReport] nbLearnings=${learnings.length}, nbURLs=${visitedUrls.length}`);
 
   const learningsString = learnings
-  .map(learning => `<learning>\n${learning}\n</learning>`)
-  .join('\n');
+    .map(learning => `<learning>\n${learning}\n</learning>`)
+    .join('\n');
 
   const promptToLLM = `Given the user prompt, write a final report, IN FRENCH, including ALL USEFUL learnings.
 Aim for at least 3 pages of text. Keep it well structured and easy to read.
@@ -350,7 +413,6 @@ ${learningsString}
   console.debug(`[writeFinalReport] Prompt:\n${promptToLLM}`);
 
   try {
-    // Pas de timeout => on laisse l'appel se finir
     const res = await generateObject({
       model: o3MiniModel,
       system: systemPrompt(),
@@ -374,8 +436,6 @@ ${learningsString}
  * Réalise une recherche approfondie en combinant plusieurs requêtes SERP.
  * Pour chaque URL trouvée, on scrape le contenu et on l'envoie au LLM pour analyse.
  */
-import pLimit from 'p-limit';
-
 export async function deepResearch({
   query,
   breadth,
@@ -428,7 +488,9 @@ export async function deepResearch({
           const allLearnings = [...learnings, ...newLearnings.learnings];
           const allUrls = [...visitedUrls, ...newUrls];
 
-          console.debug(`[deepResearch] SERP "${serpQuery.query}" => +${newLearnings.learnings.length} learnings, now total=${allLearnings.length}`);
+          console.debug(
+            `[deepResearch] SERP "${serpQuery.query}" => +${newLearnings.learnings.length} learnings, now total=${allLearnings.length}`
+          );
 
           const newDepth = depth - 1;
           if (newDepth > 0) {
@@ -463,7 +525,6 @@ export async function deepResearch({
     )
   );
 
-  // Flatten the results
   const finalLearnings = [...new Set(results.flatMap(r => r.learnings))];
   const finalUrls = [...new Set(results.flatMap(r => r.visitedUrls))];
 
